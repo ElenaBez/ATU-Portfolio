@@ -1,0 +1,10 @@
+# Never commit project finance files or staff data
+data/*
+!data/README.md
+*.xlsx
+*.xlsm
+!assets/*
+__pycache__/
+.venv/
+venv/
+.streamlit/secrets.toml
