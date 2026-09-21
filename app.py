@@ -14,7 +14,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from project_parser import CATEGORY_ORDER, Project, category_table, parse_project, project_metrics
+from project_parser import (CATEGORY_ORDER, Project, category_table, due_text, next_period_text,
+                            next_portfolio_period, parse_project, periods_ending_in_month, project_metrics)
+from reports import pie_geometry, pie_slices, portfolio_pdf, project_pdf
 
 HERE = Path(__file__).parent
 ATU_LOGO = HERE / "assets" / "atu_logo.png"
@@ -25,6 +27,7 @@ TEAL = "#005B5F"
 TEAL_LIGHT = "#7FB3B5"
 GREY = "#B0B7BB"
 PALE = "#E3ECEC"
+DUE_BG = "#FFF3CD"   # highlight for reporting periods ending this month
 RAG_COL = {"Green": "#2E8B57", "Amber": "#F2A900", "Red": "#C8102E"}
 RAG_ICON = {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}
 STATE_COL = {"Verified": TEAL, "Draft": "#F2A900", "No claim": GREY, "Remaining": PALE}
@@ -214,6 +217,9 @@ def timeline_fig(plist: list[Project], height=None) -> go.Figure:
             ))
             shown.add(st_)
     today = pd.Timestamp(date.today())
+    m0 = today.replace(day=1)
+    fig.add_vrect(x0=m0, x1=m0 + pd.offsets.MonthBegin(1), fillcolor=DUE_BG, opacity=0.8, line_width=0,
+                  layer="below")
     fig.add_shape(type="line", x0=today, x1=today, y0=0, y1=1, yref="paper",
                   line=dict(color=RAG_COL["Red"], dash="dot", width=2))
     fig.add_annotation(x=today, y=1.0, yref="paper", text="Today", showarrow=False,
@@ -247,6 +253,40 @@ def budget_actual_fig(m: pd.DataFrame) -> go.Figure:
     return fig_layout(fig, 400, barmode="group")
 
 
+def budget_pie_fig(m: pd.DataFrame) -> go.Figure:
+    """Each project's slice = its share of the portfolio budget (light colour). The darker, hatched
+    area from the centre = the share of that project's budget actually spent (area-proportional)."""
+    g = pie_geometry(m)
+    hover = [f"<b>{r.Project}</b><br>Budget: {eur(r.Budget)} ({r.Share:.1f}% of portfolio)"
+             f"<br>Spent to date: {eur(r.Spent)} ({r.Pct:.1f}% of its budget)"
+             + (f"<br><b>Overspent by {eur(r.Spent - r.Budget)}</b>" if r.Spent > r.Budget else "")
+             for r in g.itertuples()]
+    fig = go.Figure()
+    for r, h in zip(g.itertuples(), hover):              # one pair of traces per project keeps colours simple
+        fig.add_barpolar(r=[1], theta=[r.Theta], width=[r.Width], marker_color=r.Light,
+                         marker_line=dict(color=RAG_COL["Red"] if r.Over else "white", width=2),
+                         hovertext=[h], hoverinfo="text")
+        fig.add_barpolar(r=[r.R_spent], theta=[r.Theta], width=[r.Width], marker_color=r.Colour,
+                         marker_pattern=dict(shape="/", bgcolor=r.Colour, fgcolor="white", fgopacity=0.35,
+                                             size=8, fillmode="replace"),
+                         marker_line=dict(color="white", width=0), hovertext=[h], hoverinfo="text")
+    fig.add_scatterpolar(
+        r=[1.06] * len(g), theta=g["Theta"], mode="text", cliponaxis=False, hoverinfo="skip",
+        text=[f"<b>{r.Project}</b><br>Budget {eur(r.Budget)}<br>Spent {eur(r.Spent)} ({r.Pct:.0f}%)"
+              for r in g.itertuples()],
+        textposition=g["Side"].map({"right": "middle right", "left": "middle left",
+                                    "top": "top center", "bottom": "bottom center"}).tolist(),
+        textfont=dict(size=11, color="#333"),
+    )
+    fig.update_layout(
+        showlegend=False, height=600, margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor="white",
+        polar=dict(bargap=0, hole=0, bgcolor="white", barmode="overlay",
+                   radialaxis=dict(visible=False, range=[0, 1.45]),
+                   angularaxis=dict(visible=False, rotation=90, direction="clockwise")),
+    )
+    return fig
+
+
 def category_fig(t: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     fig.add_bar(x=t["Category"], y=t["Current budget"], name="Current budget", marker_color=PALE,
@@ -276,6 +316,7 @@ metrics = pd.DataFrame([project_metrics(p, amber, red, flag_under) for p in proj
 metrics["Label"] = [p.label for p in projects]
 metrics["Periods"] = metrics["Completed periods"].astype(str) + " / " + metrics["Total periods"].astype(str)
 metrics["RAG "] = metrics["RAG"].map(lambda r: f"{RAG_ICON[r]} {r}")
+metrics["Due this month"] = [due_text(p) for p in projects]
 
 
 # ===========================================================================
@@ -305,13 +346,27 @@ def portfolio_page():
         unsafe_allow_html=True,
     )
 
+    due = metrics[metrics["Due this month"] != ""]
+    if len(due):
+        st.warning(
+            f"📅 **{len(due)} project{'s' if len(due) != 1 else ''} with a reporting period ending in "
+            f"{date.today():%B %Y}:** " + " · ".join(f"**{r['Project']}** ({r['Due this month']})"
+                                                   for _, r in due.iterrows())
+        )
+    else:
+        nxt = next_portfolio_period(projects)
+        st.info(f"📅 **Next reporting period ends {nxt}**" if nxt else "All reporting periods have finished.")
+
     st.subheader("Projects")
-    st.caption("Select a row, then open the project to drill down.")
-    cols = ["RAG ", "Project", "Code", "Lead partner", "Status", "Periods", "% time", "% budget", "Gap (pts)",
-            "Current budget", "Budget to date", "Actual to date", "Variance to date",
+    st.caption("Select a row, then open the project to drill down. "
+               "Highlighted rows have a reporting period ending this month.")
+    cols = ["RAG ", "Project", "Code", "Lead partner", "Status", "Due this month", "Periods", "% time", "% budget",
+            "Gap (pts)", "Current budget", "Budget to date", "Actual to date", "Variance to date",
             "Forecast at completion", "Variance at completion"]
+    table = metrics[cols].assign(**{"Due this month": metrics["Due this month"].map(lambda v: f"📅 {v}" if v else "")})
     ev = st.dataframe(
-        metrics[cols],
+        table.style.apply(
+            lambda r: [f"background-color: {DUE_BG}" if r["Due this month"] else ""] * len(r), axis=1),
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -321,7 +376,7 @@ def portfolio_page():
             "% time": pct_bar("% time"),
             "% budget": pct_bar("% budget"),
             "Gap (pts)": st.column_config.NumberColumn(format="%+.1f"),
-            **{c: EURO for c in cols[9:]},
+            **{c: EURO for c in cols[10:]},
         },
     )
     rows = ev.selection.rows if ev and ev.selection else []
@@ -340,34 +395,30 @@ def portfolio_page():
     st.subheader("Timeline – completed and remaining periods")
     st.plotly_chart(timeline_fig(projects), key="pf_tl")
 
-    st.subheader("Portfolio by cost category")
-    cats = pd.concat([category_table(p) for p in projects])
-    cat_tot = cats.groupby("Category", as_index=False).sum(numeric_only=True)
-    cat_tot["% spent"] = 100 * cat_tot["Actual to date"] / cat_tot["Current budget"]
-    cat_tot["Category"] = pd.Categorical(cat_tot["Category"], CATEGORY_ORDER, ordered=True)
-    cat_tot = cat_tot.sort_values("Category")
-    cat_tot["Category"] = cat_tot["Category"].astype(str)
-    c1, c2 = st.columns([1, 1])
+    st.subheader("Portfolio budget split by project")
+    st.caption("Each slice is a project's share of the total portfolio budget. The darker, hatched area from the "
+               "centre of each slice shows the share of that project's budget actually spent to date "
+               "(a red outline means overspent).")
+    pie = pie_slices(metrics)
+    c1, c2 = st.columns([3, 2])
     with c1:
-        st.plotly_chart(category_fig(cat_tot), key="pf_cat")
+        st.plotly_chart(budget_pie_fig(metrics), key="pf_pie", theme=None)   # keep our own colours/hatching
     with c2:
+        key_tbl = pd.DataFrame({
+            " ": "",
+            "Project": metrics["Project"],
+            "Budget": metrics["Current budget"],
+            "Share of portfolio": 100 * metrics["Current budget"] / tot_b if tot_b else 0.0,
+            "Spent to date": metrics["Actual to date"],
+            "% spent": 100 * metrics["Actual to date"] / metrics["Current budget"].where(metrics["Current budget"] > 0),
+        })
+        colours = pie.loc[pie["Part"] == "Spent", "Colour"].tolist()
         st.dataframe(
-            cat_tot[["Category", "Current budget", "Actual to date", "Forecast at completion", "% spent"]],
+            key_tbl.style.apply(lambda c: [f"background-color: {x}" for x in colours], subset=[" "]),
             hide_index=True,
-            column_config={"Current budget": EURO, "Actual to date": EURO, "Forecast at completion": EURO,
-                           "% spent": PCT},
+            column_config={" ": st.column_config.TextColumn(" ", width=12), "Budget": EURO,
+                           "Spent to date": EURO, "Share of portfolio": PCT, "% spent": pct_bar("% spent")},
         )
-
-    st.subheader("Travel: claimed vs actually spent")
-    st.caption("Only periods where actual travel spend has been recorded on the last tab are compared.")
-    trows = []
-    for p in projects:
-        sc = p.spend_check.dropna(subset=["travel_spend"])
-        trows.append({"Project": p.name, "Periods compared": len(sc),
-                      "Travel claimed": sc["travel_claimed"].sum(), "Travel actually spent": sc["travel_spend"].sum()})
-    tdf = pd.DataFrame(trows)
-    tdf["Claimed − spent"] = tdf["Travel claimed"] - tdf["Travel actually spent"]
-    st.dataframe(tdf, hide_index=True, column_config={c: EURO for c in tdf.columns[2:]})
 
     with st.expander(f"Data checks ({sum(len(p.warnings) for p in projects) + len(load_errors)})"):
         for e in load_errors:
@@ -378,7 +429,15 @@ def portfolio_page():
         if not load_errors and not any(p.warnings for p in projects):
             st.success("No issues found.")
 
-    st.download_button(
+    c1, c2, _ = st.columns([1, 1, 2])
+    c1.download_button(
+        "⬇ Download portfolio report (PDF)",
+        data=lambda: portfolio_pdf(projects, metrics),
+        file_name=f"ATU_portfolio_report_{date.today():%Y%m%d}.pdf",
+        mime="application/pdf",
+        type="primary",
+    )
+    c2.download_button(
         "⬇ Download portfolio summary (Excel)",
         data=export_excel(),
         file_name=f"ATU_portfolio_summary_{date.today():%Y%m%d}.xlsx",
@@ -430,6 +489,17 @@ def project_page():
         f"{m['Start']:%d %b %Y} – {m['End']:%d %b %Y} &nbsp;·&nbsp; "
         f"<b>{m['Completed periods']}</b> periods completed, <b>{m['Remaining periods']}</b> remaining",
         unsafe_allow_html=True,
+    )
+    if m["Due this month"]:
+        st.warning(f"📅 Reporting period ending this month ({date.today():%B %Y}): **{m['Due this month']}**")
+    else:
+        st.info(f"📅 Next reporting period: **{next_period_text(p)}**")
+    st.download_button(
+        "⬇ Download project report (PDF)",
+        data=lambda: project_pdf(p, m),
+        file_name=f"ATU_{p.name.replace(' ', '_')}_{p.code}_report_{date.today():%Y%m%d}.pdf",
+        mime="application/pdf",
+        key=f"pdf_{sel}",
     )
 
     k = st.columns(6)
@@ -568,7 +638,11 @@ def project_page():
         tl = tl.rename(columns={"period": "Period", "start": "Start", "finish": "Finish", "status": "Status",
                                 "state": "State", "kind": "Figures", "budget": "Budget",
                                 "value": "Actual / forecast"})
-        st.dataframe(tl[["Period", "Start", "Finish", "Status", "State", "Figures", "Budget", "Actual / forecast"]],
+        due_now = set(periods_ending_in_month(p)["period"])
+        tl = tl[["Period", "Start", "Finish", "Status", "State", "Figures", "Budget", "Actual / forecast"]]
+        st.dataframe(tl.style.apply(
+                         lambda r: [f"background-color: {DUE_BG}" if r["Period"] in due_now else ""] * len(r),
+                         axis=1),
                      hide_index=True,
                      column_config={"Budget": EURO, "Actual / forecast": EURO,
                                     "Start": st.column_config.DateColumn(format="DD/MM/YYYY"),

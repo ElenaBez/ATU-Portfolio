@@ -438,3 +438,43 @@ def category_table(p: Project) -> pd.DataFrame:
     t = t.loc[order]
     t = t[(t[["Current budget", "Actual to date", "Forecast at completion"]].abs().sum(axis=1)) > 0]
     return t.reset_index().rename(columns={"category": "Category"})
+
+
+def periods_ending_in_month(p: Project, today: date | None = None) -> pd.DataFrame:
+    """Reporting periods whose finish date falls in the same calendar month as today."""
+    today = today or date.today()
+    fin = pd.to_datetime(p.periods["finish"], errors="coerce")
+    mask = (fin.dt.year == today.year) & (fin.dt.month == today.month)
+    return p.periods.loc[mask, ["period", "start", "finish", "status"]].reset_index(drop=True)
+
+
+def due_text(p: Project, today: date | None = None) -> str:
+    """e.g. 'P5 ends 30 Sep' – blank when nothing finishes this month."""
+    due = periods_ending_in_month(p, today)
+    return ", ".join(f"{r['period']} ends {pd.Timestamp(r['finish']):%d %b}" for _, r in due.iterrows())
+
+
+def next_period_end(p: Project, today: date | None = None) -> pd.Series | None:
+    """First reporting period finishing today or later (None when all periods have finished)."""
+    today = today or date.today()
+    fin = pd.to_datetime(p.periods["finish"], errors="coerce")
+    upcoming = p.periods[fin >= pd.Timestamp(today)].assign(_f=fin).sort_values("_f")
+    return None if upcoming.empty else upcoming.iloc[0]
+
+
+def next_period_text(p: Project, today: date | None = None) -> str:
+    """e.g. 'P5 ends 31 Dec 2026'."""
+    n = next_period_end(p, today)
+    if n is None:
+        return "all reporting periods have finished"
+    return f"{n['period']} ends {pd.Timestamp(n['finish']):%d %b %Y}"
+
+
+def next_portfolio_period(projects: list[Project], today: date | None = None) -> str:
+    """Earliest upcoming period end across the portfolio, e.g. '31 Oct 2026 – Harbour Link (P3)'."""
+    nxt = [(pd.Timestamp(n["finish"]), p.name, n["period"])
+           for p in projects if (n := next_period_end(p, today)) is not None]
+    if not nxt:
+        return ""
+    first = min(f for f, _, _ in nxt)
+    return f"{first:%d %b %Y} – " + ", ".join(f"{name} ({per})" for f, name, per in sorted(nxt) if f == first)
